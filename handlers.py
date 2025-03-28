@@ -8,8 +8,8 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram import types
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select, delete, func
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ChatJoinRequest
+from sqlalchemy import select, delete, func, text
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramRetryAfter
 import pandas as pd
 import os
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 from config import bot, ADMIN_IDS, CHANNEL_ID
 from database import get_movie_by_code, add_movie, AsyncSessionLocal, Movie
 from keyboards import admin_keyboard
-from models import MandatoryChannel, User
+from models import MandatoryChannel, User, JoinRequest
 
 router = Router()
 
@@ -135,6 +135,21 @@ async def start_command(message: Message, state: FSMContext):
                 reply_markup=inline_keyboard
             )
 
+@router.chat_join_request()
+async def handle_join_request(chat_join_request: ChatJoinRequest):
+    user_id = chat_join_request.from_user.id
+    channel_id = chat_join_request.chat.id
+
+    async with AsyncSessionLocal() as session:
+        existing_request = await session.execute(
+            select(JoinRequest).filter_by(user_id=user_id, channel_id=channel_id)
+        )
+        if existing_request.scalar_one_or_none() is None:
+            new_request = JoinRequest(user_id=user_id, channel_id=channel_id)
+            session.add(new_request)
+            await session.commit()
+
+
 @router.callback_query(F.data == "check_subscription")
 async def check_subscription_callback(callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -150,31 +165,30 @@ async def check_subscription_callback(callback_query: CallbackQuery):
         not_subscribed_channels = []
         for channel in mandatory_channels:
             try:
+                # 1️⃣ Foydalanuvchi kanalga obuna bo‘lganmi yoki yo‘q?
                 member = await bot.get_chat_member(channel.telegram_id, user_id)
                 if member.status in ["left", "kicked", "restricted"]:
-                    not_subscribed_channels.append(channel)
+                    raise Exception("Foydalanuvchi kanalga a’zo emas")
+
             except Exception:
-                not_subscribed_channels.append(channel)
-
-        if not not_subscribed_channels:
-            # Foydalanuvchini bazaga qo'shish
-            user_result = await session.execute(
-                select(User).filter(User.user_id == user_id)
-            )
-            user = user_result.scalar_one_or_none()
-            if not user:
-                new_user = User(
-                    user_id=user_id,
-                    name=callback_query.from_user.first_name,
+                # 2️⃣ Agar obuna bo‘lmagan bo‘lsa, zayavka tashlagan yoki yo‘qligini tekshiramiz
+                join_request = await session.execute(
+                    text("SELECT 1 FROM join_requests WHERE user_id = :user_id AND channel_id = :channel_id"),
+                    {"user_id": user_id, "channel_id": channel.telegram_id}
                 )
-                session.add(new_user)
-                await session.commit()
+                request_exists = join_request.scalar()
 
+                if not request_exists:
+                    not_subscribed_channels.append(channel)
+
+        # ✅ Agar foydalanuvchi barcha kanallarga obuna bo‘lsa yoki zayavka tashlagan bo‘lsa
+        if not not_subscribed_channels:
             await callback_query.message.edit_text(
-                "✅ Barcha kanallarga obuna bo'ldingiz!\n\n"
+                "✅ Siz barcha kanallarga obuna bo'lgansiz yoki zayavka tashlagansiz!\n\n"
                 "Kino kodini yuboring va men sizga kinoni topib beraman!"
             )
         else:
+            # ❌ Agar foydalanuvchi hali ham obuna bo‘lmagan yoki zayavka tashlamagan bo‘lsa
             inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text=f"✅ {channel.name}",
@@ -187,13 +201,14 @@ async def check_subscription_callback(callback_query: CallbackQuery):
 
             try:
                 await callback_query.message.edit_text(
-                    f"❌ Siz hali ham quyidagi kanallarga obuna bo'lmagansiz:\n\n"
+                    f"❌ Siz hali ham quyidagi kanallarga obuna bo‘lmagansiz yoki zayavka tashlamagansiz:\n\n"
                     f"{', '.join([channel.name for channel in not_subscribed_channels])}",
                     reply_markup=inline_keyboard
                 )
             except TelegramBadRequest as e:
                 if "message is not modified" in str(e).lower():
-                    await callback_query.answer("Siz hali kanallarga obuna bo'lmagansiz!")
+                    await callback_query.answer("Siz hali kanallarga obuna bo‘lmagansiz yoki zayavka tashlamagansiz!")
+
 
 @router.message(Command("cancel"))
 async def cancel_process(message: Message, state: FSMContext):
@@ -865,13 +880,24 @@ async def search_movie(message: Message):
 
         if mandatory_channels:
             not_subscribed_channels = []
+
             for channel in mandatory_channels:
                 try:
+                    # 1️⃣ Foydalanuvchi kanalga obuna bo‘lganmi yoki yo‘q - tekshiramiz
                     member = await bot.get_chat_member(channel.telegram_id, user_id)
                     if member.status in ["left", "kicked", "restricted"]:
-                        not_subscribed_channels.append(channel)
+                        raise Exception("Foydalanuvchi obuna bo‘lmagan")
+
                 except Exception:
-                    not_subscribed_channels.append(channel)
+                    # 2️⃣ Agar obuna bo‘lmagan bo‘lsa, zayavka tashlagan yoki yo‘qligini tekshiramiz
+                    join_request = await session.execute(
+                        text("SELECT 1 FROM join_requests WHERE user_id = :user_id AND channel_id = :channel_id"),
+                        {"user_id": user_id, "channel_id": channel.telegram_id}
+                    )
+                    request_exists = join_request.scalar()
+
+                    if not request_exists:
+                        not_subscribed_channels.append(channel)
 
             if not_subscribed_channels:
                 inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -885,13 +911,13 @@ async def search_movie(message: Message):
                 ])
 
                 await message.answer(
-                    "❌ Iltimos, quyidagi kanallarga obuna bo‘ling:\n\n"
+                    "❌ Iltimos, quyidagi kanallarga obuna bo‘ling yoki zayavka tashlang:\n\n"
                     f"{', '.join([channel.name for channel in not_subscribed_channels])}",
                     reply_markup=inline_keyboard
                 )
                 return
 
-        # Kino qidirish
+        # ✅ Foydalanuvchi barcha shartlarga javob bersa, kino qidira oladi
         movie = await get_movie_by_code(message.text)
         if movie:
             try:
@@ -903,4 +929,5 @@ async def search_movie(message: Message):
             except Exception as e:
                 await message.answer("❌ Kinoni yuborishda xatolik yuz berdi.")
         else:
-            await message.answer("❌ Bu kod bo'yicha kino topilmadi.")
+            await message.answer("❌ Bu kod bo‘yicha kino topilmadi.")
+
